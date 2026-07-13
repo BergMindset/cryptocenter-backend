@@ -4,6 +4,8 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import postgres from 'postgres'
+import crypto from 'node:crypto'
+import { marked } from 'marked'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
 
@@ -262,6 +264,148 @@ app.delete('/api/watchlist/:owner/:address', async (req) => {
   await sql`delete from watchlist where owner_id = ${String(req.params.owner).slice(0, 64)}
     and lower(address) = ${norm(req.params.address)}`
   return { ok: true }
+})
+
+// ============================================================================
+// Редакционный конвейер: статья на проверку в Telegram → кнопки → авто-публикация
+// Черновики лежат в media-center@marketing:frontend/drafts/<slug>.md (в прод не идут).
+// Публикация = перенос draft→content через GitHub API + repository_dispatch (Action
+// пересобирает сайт и катит в прод). Кнопки — ссылки с HMAC-подписью (не callback,
+// чтобы не трогать webhook существующего бота). Секреты — только в env.
+// ============================================================================
+const RV = {
+  bot: process.env.REVIEW_BOT_TOKEN || '',
+  chat: process.env.FOUNDER_CHAT_ID || '',
+  sign: process.env.REVIEW_SIGN_SECRET || '',
+  admin: process.env.REVIEW_ADMIN_TOKEN || '',
+  gh: process.env.GH_TOKEN_BM || '',
+  base: (process.env.PUBLIC_BASE || '').replace(/\/$/, ''),
+}
+const SRC = { owner: 'BergMindset', repo: 'media-center', branch: 'marketing' }
+const ghHeaders = { authorization: `Bearer ${RV.gh}`, accept: 'application/vnd.github+json', 'user-agent': 'cryptocenter-review' }
+
+const safeSlug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 80)
+const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const sign = (slug, action) => crypto.createHmac('sha256', RV.sign).update(`${action}:${slug}`).digest('hex').slice(0, 40)
+const verify = (slug, action, sig) => !!sig && sig.length === 40 && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sign(slug, action)))
+
+function parseFm(md) {
+  const m = md.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
+  const fm = m ? m[1] : ''
+  const body = m ? m[2] : md
+  const pick = (k) => {
+    const r = fm.match(new RegExp(`^${k}:\\s*(.+)$`, 'm'))
+    return r ? r[1].trim().replace(/^["']|["']$/g, '') : ''
+  }
+  return { title: pick('title'), lead: pick('lead'), body }
+}
+
+async function ghGetFile(path) {
+  const r = await fetch(`https://api.github.com/repos/${SRC.owner}/${SRC.repo}/contents/${path}?ref=${SRC.branch}`, { headers: ghHeaders })
+  if (r.status !== 200) return null
+  const j = await r.json()
+  return { sha: j.sha, content: j.content }
+}
+async function ghReq(method, path, body) {
+  const r = await fetch(`https://api.github.com${path}`, { method, headers: { ...ghHeaders, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
+  return { status: r.status, json: await r.json().catch(() => ({})) }
+}
+async function tgSend(text, buttons) {
+  if (!RV.bot || !RV.chat) return { ok: false }
+  const body = { chat_id: RV.chat, text, parse_mode: 'HTML', disable_web_page_preview: true }
+  if (buttons) body.reply_markup = { inline_keyboard: buttons }
+  const r = await fetch(`https://api.telegram.org/bot${RV.bot}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  return r.json().catch(() => ({ ok: false }))
+}
+
+async function publishArticle(slug) {
+  const draftPath = `frontend/drafts/${slug}.md`
+  const contentPath = `frontend/content/crypto/${slug}.md`
+  const draft = await ghGetFile(draftPath)
+  if (!draft) return { ok: false, error: 'черновик не найден' }
+  const existing = await ghGetFile(contentPath)
+  const b64 = draft.content.replace(/\s+/g, '')
+  const put = await ghReq('PUT', `/repos/${SRC.owner}/${SRC.repo}/contents/${contentPath}`, {
+    message: `publish: ${slug}`, content: b64, branch: SRC.branch, ...(existing ? { sha: existing.sha } : {}),
+  })
+  if (put.status >= 300) return { ok: false, error: 'commit контента: ' + put.status }
+  await ghReq('DELETE', `/repos/${SRC.owner}/${SRC.repo}/contents/${draftPath}`, { message: `published: ${slug}`, sha: draft.sha, branch: SRC.branch })
+  const disp = await ghReq('POST', `/repos/${SRC.owner}/${SRC.repo}/dispatches`, { event_type: 'publish', client_payload: { slug } })
+  if (disp.status >= 300) return { ok: false, error: 'dispatch сборки: ' + disp.status }
+  return { ok: true }
+}
+
+function page(title, body, kind) {
+  const accent = kind === 'ok' ? '#a8e34b' : kind === 'err' ? '#ff2e7e' : '#00e0d0'
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0d1219;color:#e9eef4;font-family:system-ui,sans-serif}
+.c{max-width:440px;padding:34px;text-align:center}.b{width:56px;height:56px;border-radius:50%;margin:0 auto 20px;border:2px solid ${accent};display:flex;align-items:center;justify-content:center;font-size:26px;color:${accent}}
+h1{font-size:22px;margin:0 0 10px}p{color:#8b98a9;line-height:1.6;margin:0}</style></head>
+<body><div class="c"><div class="b">${kind === 'ok' ? '✓' : kind === 'err' ? '!' : '•'}</div><h1>${esc(title)}</h1><p>${body}</p></div></body></html>`
+}
+
+function previewPage(title, lead, html) {
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} — черновик</title>
+<style>:root{--tl:#00e0d0}body{margin:0;background:#0d1219;color:#e9eef4;font-family:system-ui,-apple-system,sans-serif;font-size:17px;line-height:1.7}
+.w{max-width:44rem;margin:0 auto;padding:20px 22px 90px}.stamp{font:600 11px ui-monospace,monospace;letter-spacing:.14em;color:#ff2e7e;border:1px solid rgba(255,46,126,.4);padding:4px 9px;border-radius:999px;text-transform:uppercase;display:inline-block;margin:8px 0 22px}
+h1{font-size:clamp(26px,5vw,40px);line-height:1.15;font-weight:800;margin:0 0 16px}.lead{color:#8b98a9;font-size:18px;margin:0 0 26px}
+h2{font-size:24px;font-weight:800;margin:40px 0 6px}h3{font-size:18px;margin:26px 0 4px}p{margin:15px 0}a{color:var(--tl)}strong{color:#e9eef4}
+blockquote{margin:24px 0;padding:12px 18px;border-left:2px solid var(--tl);background:rgba(0,224,208,.06);color:#e9eef4}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin:20px 0;display:block;overflow-x:auto}th,td{padding:11px 14px;border:1px solid #1d2635;text-align:left}th{background:#0f1620;font:600 12px ui-monospace,monospace;text-transform:uppercase;color:#8b98a9}td:first-child{color:var(--tl);font-weight:700}
+code{font-family:ui-monospace,monospace;background:#0f1620;padding:2px 6px;border-radius:4px;color:#a8e34b}
+hr{border:0;border-top:1px solid #1d2635;margin:34px 0}</style></head>
+<body><div class="w"><span class="stamp">черновик · превью</span><h1>${esc(title)}</h1><p class="lead">${esc(lead)}</p>${html}</div></body></html>`
+}
+
+const reviewGuard = (reply) => { if (!RV.bot || !RV.gh || !RV.sign) { reply.code(503).send({ error: 'review pipeline not configured' }); return false } return true }
+
+// Отправить черновик основателю на проверку (защищено admin-ключом; дёргаю я).
+app.get('/api/review/send/:slug', async (req, reply) => {
+  if (!reviewGuard(reply)) return
+  if (req.query.key !== RV.admin || !RV.admin) return reply.code(403).send({ error: 'forbidden' })
+  const slug = safeSlug(req.params.slug)
+  const draft = await ghGetFile(`frontend/drafts/${slug}.md`)
+  if (!draft) return reply.code(404).send({ error: 'draft not found' })
+  const { title, lead } = parseFm(Buffer.from(draft.content, 'base64').toString('utf8'))
+  const text = `📝 <b>Статья на проверку</b>\n\n<b>${esc(title)}</b>\n\n${esc(lead).slice(0, 600)}`
+  const buttons = [
+    [{ text: '👀 Черновик', url: `${RV.base}/api/review/preview/${slug}` }],
+    [{ text: '✅ Опубликовать', url: `${RV.base}/api/review/publish/${slug}?sig=${sign(slug, 'publish')}` },
+     { text: '✏️ На редакцию', url: `${RV.base}/api/review/reject/${slug}?sig=${sign(slug, 'reject')}` }],
+  ]
+  const r = await tgSend(text, buttons)
+  return { ok: !!r.ok, slug, title }
+})
+
+// Превью черновика (или уже опубликованной) — рендер Markdown в HTML.
+app.get('/api/review/preview/:slug', async (req, reply) => {
+  const slug = safeSlug(req.params.slug)
+  const f = (await ghGetFile(`frontend/drafts/${slug}.md`)) || (await ghGetFile(`frontend/content/crypto/${slug}.md`))
+  reply.type('text/html; charset=utf-8')
+  if (!f) { reply.code(404); return page('Не найдено', 'Черновик не найден.', 'err') }
+  const { title, lead, body } = parseFm(Buffer.from(f.content, 'base64').toString('utf8'))
+  return previewPage(title, lead, marked.parse(body))
+})
+
+// Кнопка «Опубликовать» → перенос в content + запуск сборки.
+app.get('/api/review/publish/:slug', async (req, reply) => {
+  const slug = safeSlug(req.params.slug)
+  reply.type('text/html; charset=utf-8')
+  if (!RV.gh || !RV.sign) { reply.code(503); return page('Не настроено', 'Конвейер публикации не сконфигурирован.', 'err') }
+  if (!verify(slug, 'publish', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная или устаревшая подпись ссылки.', 'err') }
+  const res = await publishArticle(slug)
+  if (!res.ok) { reply.code(400); return page('Не удалось опубликовать', esc(res.error), 'err') }
+  await tgSend(`✅ Опубликовано: <b>${esc(slug)}</b>\nСайт обновится через ~2 минуты.`, null)
+  return page('Опубликовано ✓', 'Статья ушла в прод. Сайт cryptocenter.finance обновится через ~2 минуты.', 'ok')
+})
+
+// Кнопка «На редакцию» → пометка на доработку.
+app.get('/api/review/reject/:slug', async (req, reply) => {
+  const slug = safeSlug(req.params.slug)
+  reply.type('text/html; charset=utf-8')
+  if (!verify(slug, 'reject', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная подпись ссылки.', 'err') }
+  await tgSend(`✏️ На редакцию: <b>${esc(slug)}</b>\nЧерновик остаётся неопубликованным — жду правок.`, null)
+  return page('Отправлено на редакцию', 'Черновик остался неопубликованным. Редакция получила пометку.', 'ok')
 })
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => console.log('media-backend на :' + PORT))
