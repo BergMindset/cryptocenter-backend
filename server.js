@@ -4,6 +4,8 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import postgres from 'postgres'
+import { createPublicClient, http, fallback, getAddress } from 'viem'
+import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
 
 const PORT = Number(process.env.PORT || 8080)
 const DB = process.env.DATABASE_URL
@@ -94,6 +96,124 @@ app.get('/api/portfolio/:address', async (req, reply) => {
   const results = res.filter((r) => r.assets.length).sort((x, y) => y.total - x.total)
   const grandTotal = results.reduce((s, r) => s + r.total, 0)
   return { address: a, grandTotal, chains: results, scannedChains: chains.length }
+})
+
+// --- Концентрированные позиции (Uniswap V3 / PancakeSwap V3) — читаем он-чейн ---
+// V3-позиции = NFT, их не видно как балансы токенов. Считаем суммы из ликвидности и
+// тиков (tick-математика), цены — через ценовой эндпоинт GoldRush. Только для чейнов,
+// где у адреса реально есть позиции (balanceOf>0), через multicall — нагрузка ограничена.
+const NPM_ABI = [
+  { name: 'balanceOf', type: 'function', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'tokenOfOwnerByIndex', type: 'function', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }] },
+  { name: 'positions', type: 'function', stateMutability: 'view', inputs: [{ type: 'uint256' }], outputs: [
+    { type: 'uint96' }, { type: 'address' }, { type: 'address' }, { type: 'address' }, { type: 'uint24' },
+    { type: 'int24' }, { type: 'int24' }, { type: 'uint128' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint128' }, { type: 'uint128' } ] },
+]
+const FACTORY_ABI = [{ name: 'getPool', type: 'function', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'uint24' }], outputs: [{ type: 'address' }] }]
+const POOL_ABI = [{ name: 'slot0', type: 'function', stateMutability: 'view', inputs: [], outputs: [
+  { type: 'uint160' }, { type: 'int24' }, { type: 'uint16' }, { type: 'uint16' }, { type: 'uint16' }, { type: 'uint8' }, { type: 'bool' } ] }]
+const ERC20_ABI = [
+  { name: 'symbol', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
+  { name: 'decimals', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
+]
+const UNI = { npm: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984' }
+const PANCAKE = { npm: '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865' }
+const V3_SOURCES = [
+  { title: 'Ethereum', color: '#6b8cff', gr: 'eth-mainnet', chain: mainnet, rpcs: ['https://ethereum-rpc.publicnode.com', 'https://eth.llamarpc.com'], dexes: [{ protocol: 'Uniswap V3', ...UNI }, { protocol: 'PancakeSwap V3', ...PANCAKE }] },
+  { title: 'Arbitrum', color: '#28a0f0', gr: 'arbitrum-mainnet', chain: arbitrum, rpcs: ['https://arbitrum-one-rpc.publicnode.com', 'https://arb1.arbitrum.io/rpc'], dexes: [{ protocol: 'Uniswap V3', ...UNI }] },
+  { title: 'Optimism', color: '#ff0420', gr: 'optimism-mainnet', chain: optimism, rpcs: ['https://optimism-rpc.publicnode.com', 'https://mainnet.optimism.io'], dexes: [{ protocol: 'Uniswap V3', ...UNI }] },
+  { title: 'Polygon', color: '#8247e5', gr: 'matic-mainnet', chain: polygon, rpcs: ['https://polygon-bor-rpc.publicnode.com', 'https://polygon-rpc.com'], dexes: [{ protocol: 'Uniswap V3', ...UNI }] },
+  { title: 'Base', color: '#0052ff', gr: 'base-mainnet', chain: base, rpcs: ['https://base-rpc.publicnode.com', 'https://mainnet.base.org'], dexes: [{ protocol: 'Uniswap V3', npm: '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1', factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD' }] },
+  { title: 'BNB Chain', color: '#f0b90b', gr: 'bsc-mainnet', chain: bsc, rpcs: ['https://bsc-rpc.publicnode.com', 'https://binance.llamarpc.com'], dexes: [{ protocol: 'PancakeSwap V3', ...PANCAKE }, { protocol: 'Uniswap V3', npm: '0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613', factory: '0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7' }] },
+]
+const ZERO = '0x0000000000000000000000000000000000000000'
+
+// суммы токенов позиции из ликвидности и тиков (float — для отображения оценки)
+function amountsFor(liquidity, tickLower, tickUpper, sqrtPriceX96, curTick) {
+  const L = Number(liquidity)
+  const sa = Math.pow(1.0001, tickLower / 2)
+  const sb = Math.pow(1.0001, tickUpper / 2)
+  const sp = Number(sqrtPriceX96) / 2 ** 96
+  let a0 = 0, a1 = 0
+  if (curTick < tickLower) a0 = L * (sb - sa) / (sa * sb)
+  else if (curTick >= tickUpper) a1 = L * (sb - sa)
+  else { a0 = L * (sb - sp) / (sp * sb); a1 = L * (sp - sa) }
+  return { a0, a1 }
+}
+
+async function grPrices(grChain, addrs) {
+  const map = {}
+  if (!addrs.length || !GR_KEY) return map
+  try {
+    const url = `https://api.covalenthq.com/v1/pricing/historical_by_addresses_v2/${grChain}/USD/${addrs.join(',')}/`
+    const d = await fetch(url, { headers: { Authorization: `Bearer ${GR_KEY}` } }).then((r) => r.json())
+    for (const it of d.data || []) map[it.contract_address.toLowerCase()] = it.items?.[0]?.price ?? null
+  } catch { /* цены недоступны — покажем позицию без $ */ }
+  return map
+}
+
+async function readV3Chain(source, owner) {
+  const client = createPublicClient({ chain: source.chain, transport: fallback(source.rpcs.map((u) => http(u)), { rank: false }) })
+  const raw = []
+  for (const dex of source.dexes) {
+    let n = 0
+    try { n = Number(await client.readContract({ address: dex.npm, abi: NPM_ABI, functionName: 'balanceOf', args: [owner] })) } catch { continue }
+    if (!n) continue
+    const cap = Math.min(n, 80)
+    const tok = await client.multicall({ contracts: Array.from({ length: cap }, (_, i) => ({ address: dex.npm, abi: NPM_ABI, functionName: 'tokenOfOwnerByIndex', args: [owner, BigInt(i)] })), allowFailure: true })
+    const ids = tok.filter((t) => t.status === 'success').map((t) => t.result)
+    if (!ids.length) continue
+    const pos = await client.multicall({ contracts: ids.map((id) => ({ address: dex.npm, abi: NPM_ABI, functionName: 'positions', args: [id] })), allowFailure: true })
+    const items = []
+    for (const r of pos) if (r.status === 'success' && r.result[7] > 0n) {
+      const p = r.result
+      items.push({ token0: p[2], token1: p[3], fee: p[4], tickLower: p[5], tickUpper: p[6], liquidity: p[7] })
+    }
+    if (!items.length) continue
+    const pools = await client.multicall({ contracts: items.map((p) => ({ address: dex.factory, abi: FACTORY_ABI, functionName: 'getPool', args: [p.token0, p.token1, p.fee] })), allowFailure: true })
+    items.forEach((p, i) => { p.pool = pools[i].status === 'success' ? pools[i].result : null })
+    const withPool = items.filter((p) => p.pool && p.pool !== ZERO)
+    if (!withPool.length) continue
+    const slots = await client.multicall({ contracts: withPool.map((p) => ({ address: p.pool, abi: POOL_ABI, functionName: 'slot0' })), allowFailure: true })
+    withPool.forEach((p, i) => { if (slots[i].status === 'success') { p.sqrtP = slots[i].result[0]; p.tick = slots[i].result[1] } })
+    const live = withPool.filter((p) => p.sqrtP != null)
+    if (!live.length) continue
+    const toks = [...new Set(live.flatMap((p) => [p.token0.toLowerCase(), p.token1.toLowerCase()]))]
+    const meta = await client.multicall({ contracts: toks.flatMap((t) => [{ address: t, abi: ERC20_ABI, functionName: 'symbol' }, { address: t, abi: ERC20_ABI, functionName: 'decimals' }]), allowFailure: true })
+    const m = {}
+    toks.forEach((t, i) => { m[t] = { sym: meta[i * 2].status === 'success' ? meta[i * 2].result : '?', dec: meta[i * 2 + 1].status === 'success' ? Number(meta[i * 2 + 1].result) : 18 } })
+    const prices = await grPrices(source.gr, toks)
+    for (const p of live) {
+      const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase()
+      const { a0, a1 } = amountsFor(p.liquidity, p.tickLower, p.tickUpper, p.sqrtP, p.tick)
+      const amt0 = a0 / 10 ** m[t0].dec, amt1 = a1 / 10 ** m[t1].dec
+      const priced = prices[t0] != null || prices[t1] != null
+      const usd = amt0 * (prices[t0] ?? 0) + amt1 * (prices[t1] ?? 0)
+      raw.push({
+        protocol: dex.protocol, chainTitle: source.title, chainColor: source.color,
+        pair: `${m[t0].sym}/${m[t1].sym}`, feePct: Number(p.fee) / 10000,
+        inRange: p.tick >= p.tickLower && p.tick < p.tickUpper,
+        amt0, sym0: m[t0].sym, amt1, sym1: m[t1].sym, usd: priced ? usd : null,
+      })
+    }
+  }
+  return raw
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((res) => setTimeout(() => res([]), ms))])
+}
+
+app.get('/api/defi-v3/:address', async (req, reply) => {
+  const a = String(req.params.address || '')
+  if (!/^0x[0-9a-fA-F]{40}$/.test(a)) return reply.code(400).send({ error: 'bad address' })
+  if (!GR_KEY) return reply.code(503).send({ error: 'no provider key' })
+  const owner = getAddress(a)
+  const res = await Promise.allSettled(V3_SOURCES.map((s) => withTimeout(readV3Chain(s, owner), 22000)))
+  const positions = res.flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
+  positions.sort((x, y) => (y.usd ?? -1) - (x.usd ?? -1))
+  const total = positions.reduce((s, p) => s + (p.usd ?? 0), 0)
+  return { address: a, positions, total }
 })
 
 // --- Публичные метки адреса (shared) ---
