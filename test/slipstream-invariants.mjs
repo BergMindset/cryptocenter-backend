@@ -5,7 +5,7 @@
 // Запуск: node test/slipstream-invariants.mjs
 import { decodeFunctionData } from 'viem'
 import {
-  baseClient, verifyPool, assertStablePair, buildEnterPlan, describePlan,
+  baseClient, verifyPool, assertStablePair, buildEnterPlan, describePlan, poolTick, verifyPosition,
   AERODROME, CORRIDORS, NFPM_ABI, ERC20_ABI,
 } from '../lib/slipstream-core.mjs'
 
@@ -76,6 +76,18 @@ console.log('4. describePlan (то, что видит юзер)…')
 const desc = describePlan(meta, plan, BUDGET)
 check('describe: пул и суммы читаемы', desc.pool.includes('/') && desc.need[meta.token0.symbol] >= 0 && desc.corridors.length === 3)
 console.log(`  нужно: ${JSON.stringify(desc.need)}`)
+
+console.log('5. K3: poolTick после verify берёт decimals из кэша (не хардкод 6/6)…')
+const tk = await poolTick(client, KNOWN_GOOD_POOL)
+check('tick: цена ≈ 1 (decimals корректны)', Math.abs(tk.price - 1) < 0.05, `price=${tk.price}`)
+
+console.log('6. K9: verifyPosition отвергает несуществующую/чужую позицию…')
+let posRejected = false
+try { await verifyPosition(client, '999999999', DUMMY_OWNER) } catch { posRejected = true }
+check('несуществующая позиция отвергнута', posRejected)
+let addrRejected = false
+try { await verifyPosition(client, '1', 'нонсенс') } catch { addrRejected = true }
+check('битый адрес отвергнут', addrRejected)
 
 console.log(`\nИТОГ: ${passed} ✓ / ${failed} ✗`)
 process.exit(failed ? 1 : 0)
