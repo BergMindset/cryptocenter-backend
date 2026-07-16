@@ -18,6 +18,8 @@ if (!DB) {
 const sql = postgres(DB, { ssl: 'require', max: 5 })
 const app = Fastify({ logger: true })
 await app.register(cors, { origin: true }) // разрешаем кросс-домен (журнал → бэкенд)
+// Сервис «вход в пулы по схеме фонда» (MVP: Aerodrome/Base, стейбл-пары; юзер подписывает сам)
+await app.register((await import('./lib/pools-routes.mjs')).default)
 
 const isAddr = (a) => /^0x[0-9a-fA-F]{40}$/.test(String(a || ''))
 const norm = (a) => String(a).toLowerCase()
