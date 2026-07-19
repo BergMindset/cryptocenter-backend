@@ -6,6 +6,8 @@ import cors from '@fastify/cors'
 import postgres from 'postgres'
 import crypto from 'node:crypto'
 import { marked } from 'marked'
+import { getFacts } from './lib/factory/facts.mjs'
+import { checkPost } from './lib/factory/compliance.mjs'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
 
@@ -408,6 +410,95 @@ app.get('/api/review/reject/:slug', async (req, reply) => {
   if (!verify(slug, 'reject', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная подпись ссылки.', 'err') }
   await tgSend(`✏️ На редакцию: <b>${esc(slug)}</b>\nЧерновик остаётся неопубликованным — жду правок.`, null)
   return page('Отправлено на редакцию', 'Черновик остался неопубликованным. Редакция получила пометку.', 'ok')
+})
+
+// ============================================================================
+// КОНТЕНТ-ФАБРИКА GLASS ENGINE: комплаенс-гейт + ревью ЛЮБОГО поста → кнопка.
+// Переиспользует @BergAlertsbot + HMAC-кнопки (как журнал). Инвариант: 0 публикаций
+// мимо кнопки. Гейт блокирует ОТПРАВКУ превью (брак не доходит до основателя).
+// Публикация = пост в канал (если бот админ) либо готовый текст основателю в личку.
+// ============================================================================
+sql`create table if not exists factory_posts (
+  id text primary key, text text not null, channel text, lang text default 'ru',
+  verdict jsonb, status text default 'pending', created_at timestamptz default now()
+)`.catch((e) => console.error('factory_posts table:', e.message))
+
+const safeId = (s) => String(s || '').replace(/[^a-f0-9]/g, '').slice(0, 32)
+const newId = () => crypto.randomBytes(8).toString('hex')
+
+function verdictLine(v) {
+  const blocks = v.violations.filter((x) => x.severity === 'block')
+  const warns = v.violations.filter((x) => x.severity === 'warn')
+  if (v.pass && !warns.length) return `✅ Комплаенс PASS · цифр сверено: ${v.checkedNumbers} · вне реестра: 0`
+  if (v.pass) return `✅ PASS · ⚠️ ${warns.map((w) => w.detail).join('; ')}`
+  return `⛔ BLOCK: ${blocks.map((b) => b.detail).join('; ')}`
+}
+
+async function tgPostChannel(channel, text) {
+  if (!RV.bot) return { ok: false, description: 'нет токена бота' }
+  const r = await fetch(`https://api.telegram.org/bot${RV.bot}/sendMessage`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id: channel, text }),
+  })
+  return r.json().catch(() => ({ ok: false, description: 'bad response' }))
+}
+
+// Только проверка комплаенса (без отправки) — отладка и предпросмотр вердикта.
+app.post('/api/factory/check', async (req, reply) => {
+  if (req.query.key !== RV.admin || !RV.admin) return reply.code(403).send({ error: 'forbidden' })
+  const facts = await getFacts()
+  const verdict = checkPost(String(req.body?.text || ''), facts)
+  return { verdict, summary: verdictLine(verdict), centerUp: verdict.centerUp }
+})
+
+// Отправить пост основателю на ревью — ТОЛЬКО если прошёл комплаенс.
+app.post('/api/factory/review', async (req, reply) => {
+  if (!RV.bot || !RV.sign) return reply.code(503).send({ error: 'not configured' })
+  if (req.query.key !== RV.admin || !RV.admin) return reply.code(403).send({ error: 'forbidden' })
+  const text = String(req.body?.text || '').trim()
+  if (text.length < 10) return reply.code(400).send({ error: 'empty text' })
+  const channel = String(req.body?.channel || '@YLDXMAIN').slice(0, 40)
+  const lang = String(req.body?.lang || 'ru').slice(0, 5)
+  const facts = await getFacts()
+  const verdict = checkPost(text, facts)
+  if (!verdict.pass) return { ok: false, blocked: true, verdict, summary: verdictLine(verdict) } // гейт: превью не уходит
+  const id = newId()
+  await sql`insert into factory_posts (id, text, channel, lang, verdict) values (${id}, ${text}, ${channel}, ${lang}, ${sql.json(verdict)})`
+  const preview = `📣 <b>Пост на проверку</b> → ${esc(channel)}\n\n${esc(text).slice(0, 3600)}\n\n${esc(verdictLine(verdict))}`
+  const buttons = [[
+    { text: '✅ Опубликовать', url: `${RV.base}/api/factory/publish/${id}?sig=${sign(id, 'fpublish')}` },
+    { text: '✏️ На редакцию', url: `${RV.base}/api/factory/reject/${id}?sig=${sign(id, 'freject')}` },
+  ]]
+  const r = await tgSend(preview, buttons)
+  return { ok: !!r.ok, id, verdict, summary: verdictLine(verdict) }
+})
+
+// Кнопка «Опубликовать» → пост в канал (если бот админ), иначе готовый текст основателю.
+app.get('/api/factory/publish/:id', async (req, reply) => {
+  reply.type('text/html; charset=utf-8')
+  const id = safeId(req.params.id)
+  if (!verify(id, 'fpublish', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная подпись ссылки.', 'err') }
+  const [row] = await sql`select * from factory_posts where id = ${id}`
+  if (!row) { reply.code(404); return page('Не найдено', 'Пост не найден.', 'err') }
+  if (row.status === 'published') return page('Уже опубликовано', 'Этот пост уже отправлен.', 'ok')
+  const posted = await tgPostChannel(row.channel, row.text)
+  await sql`update factory_posts set status = 'published' where id = ${id}`
+  if (posted.ok) {
+    await tgSend(`✅ Опубликовано в ${esc(row.channel)}.`, null)
+    return page('Опубликовано ✓', `Пост ушёл в ${esc(row.channel)}. Проверь канал.`, 'ok')
+  }
+  await tgSend(`⚠️ Не смог запостить в ${esc(row.channel)} (${esc(posted.description || 'бот не админ')}). Готовый пост — вставь вручную:\n\n${esc(row.text)}`, null)
+  return page('Готово к постингу', `Бот пока не админ ${esc(row.channel)} — прислал готовый пост тебе в личку. Добавь @BergAlertsbot админом канала — и публикация пойдёт прямо по кнопке.`, 'ok')
+})
+
+// Кнопка «На редакцию».
+app.get('/api/factory/reject/:id', async (req, reply) => {
+  reply.type('text/html; charset=utf-8')
+  const id = safeId(req.params.id)
+  if (!verify(id, 'freject', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная подпись ссылки.', 'err') }
+  await sql`update factory_posts set status = 'rejected' where id = ${id}`
+  await tgSend(`✏️ Пост на редакцию (id ${esc(id)}) — не опубликован, жду правок.`, null)
+  return page('На редакцию', 'Пост не опубликован. Редакция получила пометку.', 'ok')
 })
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => console.log('media-backend на :' + PORT))
