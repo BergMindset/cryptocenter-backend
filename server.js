@@ -8,6 +8,7 @@ import crypto from 'node:crypto'
 import { marked } from 'marked'
 import { getFacts } from './lib/factory/facts.mjs'
 import { checkPost } from './lib/factory/compliance.mjs'
+import { distribute, platformStatus } from './lib/factory/distribute.mjs'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
 
@@ -422,6 +423,10 @@ sql`create table if not exists factory_posts (
   id text primary key, text text not null, channel text, lang text default 'ru',
   verdict jsonb, status text default 'pending', created_at timestamptz default now()
 )`.catch((e) => console.error('factory_posts table:', e.message))
+sql`create table if not exists factory_distribution (
+  post_id text, platform text, ok boolean, skipped boolean default false,
+  detail text, ts timestamptz default now()
+)`.catch((e) => console.error('factory_distribution table:', e.message))
 
 const safeId = (s) => String(s || '').replace(/[^a-f0-9]/g, '').slice(0, 32)
 const newId = () => crypto.randomBytes(8).toString('hex')
@@ -473,6 +478,103 @@ app.post('/api/factory/review', async (req, reply) => {
   return { ok: !!r.ok, id, verdict, summary: verdictLine(verdict) }
 })
 
+// ============================================================================
+// СТАТУС ДЛЯ ЦЕНТРА: read-only слепок медиа-конвейера под ОТДЕЛЬНЫМ токеном.
+// Устав: «медиа отдаёт статус, Центр читает». Никаких мутаций, никаких секретов
+// в ответе. Чего в данных нет — null, не выдумываем (series и ts смены статуса
+// не хранятся в factory_posts — до миграции отдаём null).
+// ============================================================================
+const MEDIA_STATUS_TOKEN = process.env.MEDIA_STATUS_TOKEN || ''
+
+let adminCache = { at: 0, val: null }
+async function botIsAdmin(channel) {
+  if (!RV.bot) return null
+  if (Date.now() - adminCache.at < 300000) return adminCache.val
+  try {
+    const me = await (await fetch(`https://api.telegram.org/bot${RV.bot}/getMe`)).json()
+    if (!me.ok) return null
+    const r = await (await fetch(
+      `https://api.telegram.org/bot${RV.bot}/getChatMember?chat_id=${encodeURIComponent(channel)}&user_id=${me.result.id}`,
+    )).json()
+    adminCache = { at: Date.now(), val: r.ok ? ['administrator', 'creator'].includes(r.result.status) : null }
+  } catch { adminCache = { at: Date.now(), val: null } }
+  return adminCache.val
+}
+
+const STAGE = { pending: 'awaiting_button', published: 'published', rejected: 'rejected' }
+// channel в factory_posts — телеграм-хэндл ('@YLDXMAIN'); прочие платформы появятся со своими ключами
+const channelKey = (c) => (String(c || '').startsWith('@') ? 'tg' : String(c || '') || null)
+
+app.get('/api/media/status', async (req, reply) => {
+  if (!MEDIA_STATUS_TOKEN || req.query.key !== MEDIA_STATUS_TOKEN) return reply.code(403).send({ error: 'forbidden' })
+  const rows = await sql`
+    select id, text, channel, lang, verdict, status, created_at
+    from factory_posts order by created_at desc limit 50`
+  const posts = rows.map((p) => ({
+    id: p.id,
+    title: String(p.text || '').split('\n')[0].slice(0, 100),
+    series: null, // в factory_posts нет колонки; появится миграцией
+    channel: channelKey(p.channel),
+    rubric: null, // не хранится; появится миграцией
+    stage: STAGE[p.status] || p.status, // draft/checking не существуют: до БД доходит только прошедшее гейт
+    compliance: p.verdict?.pass === false ? 'BLOCK' : p.verdict ? 'PASS' : null,
+    createdAt: p.created_at,
+    publishedAt: null, // время нажатия кнопки не хранится; появится миграцией (decided_at)
+  }))
+  const pendingTg = rows.filter((p) => p.status === 'pending' && channelKey(p.channel) === 'tg').length
+  const offCh = (key) => ({ key, handle: null, connected: false, botAdmin: null, scheduled: 0, followers: null, reach30d: null })
+  const now = Date.now()
+  return {
+    asOf: new Date().toISOString(),
+    posts,
+    channels: [
+      { key: 'tg-channel', handle: '@YLDXMAIN', connected: !!RV.bot, botAdmin: await botIsAdmin('@YLDXMAIN'), scheduled: pendingTg, followers: null, reach30d: null },
+      { key: 'tg-chat', handle: null, connected: !!RV.chat, botAdmin: null, scheduled: 0, followers: null, reach30d: null }, // личка основателя (кнопки ревью)
+      offCh('x'), offCh('youtube'), offCh('instagram'), offCh('tiktok'), offCh('email'),
+    ],
+    // Доп. поле сверх контракта v2 (мост Центра fail-soft): реальный статус раздатчика
+    // по площадкам, вкл. VK/RuTube, которых нет в фикс-ключах channels[].
+    // last = последний исход раздачи, counters = за всё время (из журнала factory_distribution).
+    platforms: await (async () => {
+      const [lasts, counts] = await Promise.all([
+        sql`select distinct on (platform) platform, ok, skipped, detail, ts
+            from factory_distribution order by platform, ts desc`,
+        sql`select platform,
+              count(*) filter (where ok) as ok,
+              count(*) filter (where not ok and not skipped) as err,
+              count(*) filter (where skipped) as skipped
+            from factory_distribution group by platform`,
+      ]).catch(() => [[], []])
+      const lastBy = Object.fromEntries(lasts.map((r) => [r.platform, { ok: r.ok, skipped: r.skipped, detail: r.detail, ts: r.ts }]))
+      const cntBy = Object.fromEntries(counts.map((r) => [r.platform, { ok: +r.ok, err: +r.err, skipped: +r.skipped }]))
+      return platformStatus().map((p) => ({
+        ...p,
+        last: lastBy[p.key] || null,
+        counters: cntBy[p.key] || { ok: 0, err: 0, skipped: 0 },
+      }))
+    })(),
+    integrations: [
+      { key: 'content-factory', label: 'Контент-фабрика (facts+compliance+кнопка)', status: 'connected' },
+      { key: 'higgsfield', label: 'Higgsfield (аватар/видео)', status: 'pending' }, // ждёт основателя: Plus + 3 гейта
+      { key: 'blotato', label: 'Blotato (кросспостинг)', status: 'off' },
+      { key: 'n8n', label: 'n8n (оркестрация)', status: 'off' },
+      { key: 'opusclip', label: 'OpusClip (нарезка)', status: 'off' },
+    ],
+    kpis: {
+      postsThisWeek: rows.filter((p) => now - new Date(p.created_at).getTime() < 7 * 864e5).length,
+      published: rows.filter((p) => p.status === 'published').length,
+      awaiting: rows.filter((p) => p.status === 'pending').length,
+      blocked: 0, // брак гейт до БД не пускает — заблокированные черновики нигде не копятся
+    },
+    // Честный аудит: ts есть только у отправки на ревью (created_at);
+    // время нажатия кнопки не хранится — отдаём событие без ts до миграции.
+    audit: rows.flatMap((p) => [
+      { ts: p.created_at, action: 'review_sent', postId: p.id },
+      ...(p.status !== 'pending' ? [{ ts: null, action: p.status, postId: p.id }] : []),
+    ]).slice(0, 50),
+  }
+})
+
 // Кнопка «Опубликовать» → пост в канал (если бот админ), иначе готовый текст основателю.
 app.get('/api/factory/publish/:id', async (req, reply) => {
   reply.type('text/html; charset=utf-8')
@@ -483,11 +585,21 @@ app.get('/api/factory/publish/:id', async (req, reply) => {
   if (row.status === 'published') return page('Уже опубликовано', 'Этот пост уже отправлен.', 'ok')
   const posted = await tgPostChannel(row.channel, row.text)
   await sql`update factory_posts set status = 'published' where id = ${id}`
-  if (posted.ok) {
-    await tgSend(`✅ Опубликовано в ${esc(row.channel)}.`, null)
-    return page('Опубликовано ✓', `Пост ушёл в ${esc(row.channel)}. Проверь канал.`, 'ok')
+
+  // РАЗДАТЧИК: после кнопки — веером на остальные подключённые площадки.
+  // Каждый исход пишем в журнал; неподключённые площадки — skipped, не ошибка.
+  const fan = await distribute(row.text)
+  for (const f of fan) {
+    await sql`insert into factory_distribution (post_id, platform, ok, skipped, detail)
+      values (${id}, ${f.key}, ${f.ok}, ${!!f.skipped}, ${f.detail})`.catch((e) => console.error('distribution log:', e.message))
   }
-  await tgSend(`⚠️ Не смог запостить в ${esc(row.channel)} (${esc(posted.description || 'бот не админ')}). Готовый пост — вставь вручную:\n\n${esc(row.text)}`, null)
+  const fanLine = fan.map((f) => `${f.ok ? '✅' : f.skipped ? '➖' : '⚠️'} ${f.label}`).join(' · ')
+
+  if (posted.ok) {
+    await tgSend(`✅ Опубликовано в ${esc(row.channel)}.\nРаздача: ${esc(fanLine)}`, null)
+    return page('Опубликовано ✓', `Пост ушёл в ${esc(row.channel)}. Раздача: ${esc(fanLine)}`, 'ok')
+  }
+  await tgSend(`⚠️ Не смог запостить в ${esc(row.channel)} (${esc(posted.description || 'бот не админ')}). Раздача: ${esc(fanLine)}\nГотовый пост — вставь вручную:\n\n${esc(row.text)}`, null)
   return page('Готово к постингу', `Бот пока не админ ${esc(row.channel)} — прислал готовый пост тебе в личку. Добавь @BergAlertsbot админом канала — и публикация пойдёт прямо по кнопке.`, 'ok')
 })
 
