@@ -9,6 +9,8 @@ import { marked } from 'marked'
 import { getFacts } from './lib/factory/facts.mjs'
 import { checkPost } from './lib/factory/compliance.mjs'
 import { distribute, platformStatus } from './lib/factory/distribute.mjs'
+import { buildRegistry } from './lib/factory/registry.mjs'
+import { mediaAuth } from './lib/media-auth.mjs'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
 
@@ -485,6 +487,17 @@ app.post('/api/factory/review', async (req, reply) => {
 // не хранятся в factory_posts — до миграции отдаём null).
 // ============================================================================
 const MEDIA_STATUS_TOKEN = process.env.MEDIA_STATUS_TOKEN || ''
+const MEDIA_REGISTRY_TOKEN = process.env.MEDIA_REGISTRY_TOKEN || ''
+
+// Реестр брендов/площадок для панели Центра (Media OS, инвентаризация).
+// Контракт Центра 02.08: Bearer-заголовок, 401 без токена, секретов в ответе нет
+// (только булево hasAccess и ИМЕНА env-переменных), queue с явным order.
+app.get('/api/media/registry', async (req, reply) => {
+  const auth = String(req.headers.authorization || '')
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  if (!MEDIA_REGISTRY_TOKEN || token !== MEDIA_REGISTRY_TOKEN) return reply.code(401).send({ error: 'unauthorized' })
+  return buildRegistry()
+})
 
 let adminCache = { at: 0, val: null }
 async function botIsAdmin(channel) {
@@ -506,7 +519,9 @@ const STAGE = { pending: 'awaiting_button', published: 'published', rejected: 'r
 const channelKey = (c) => (String(c || '').startsWith('@') ? 'tg' : String(c || '') || null)
 
 app.get('/api/media/status', async (req, reply) => {
-  if (!MEDIA_STATUS_TOKEN || req.query.key !== MEDIA_STATUS_TOKEN) return reply.code(403).send({ error: 'forbidden' })
+  const auth = mediaAuth(req, MEDIA_STATUS_TOKEN)
+  if (!auth.ok) return reply.code(403).send({ error: 'forbidden' })
+  if (auth.legacy) req.log.warn('media/status: ключ пришёл в ?key= (устаревший путь) — Центр ещё не переключён на заголовок x-media-key')
   const rows = await sql`
     select id, text, channel, lang, verdict, status, created_at
     from factory_posts order by created_at desc limit 50`
