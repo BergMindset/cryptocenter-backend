@@ -10,6 +10,7 @@ import { getFacts } from './lib/factory/facts.mjs'
 import { checkPost } from './lib/factory/compliance.mjs'
 import { distribute, platformStatus } from './lib/factory/distribute.mjs'
 import { buildRegistry } from './lib/factory/registry.mjs'
+import { buildOutreach } from './lib/factory/outreach.mjs'
 import { mediaAuth } from './lib/media-auth.mjs'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
@@ -497,6 +498,15 @@ app.get('/api/media/registry', async (req, reply) => {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
   if (!MEDIA_REGISTRY_TOKEN || token !== MEDIA_REGISTRY_TOKEN) return reply.code(401).send({ error: 'unauthorized' })
   return buildRegistry()
+})
+
+// Секция «Дистрибуция и адресная работа»: роли агентов, кампании по теме, очереди.
+// Тот же доверенный контур, что реестр (Bearer MEDIA_REGISTRY_TOKEN), read-only.
+app.get('/api/media/outreach', async (req, reply) => {
+  const auth = String(req.headers.authorization || '')
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  if (!MEDIA_REGISTRY_TOKEN || token !== MEDIA_REGISTRY_TOKEN) return reply.code(401).send({ error: 'unauthorized' })
+  return buildOutreach()
 })
 
 let adminCache = { at: 0, val: null }
