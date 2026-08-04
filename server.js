@@ -11,6 +11,7 @@ import { checkPost } from './lib/factory/compliance.mjs'
 import { distribute, platformStatus } from './lib/factory/distribute.mjs'
 import { buildRegistry } from './lib/factory/registry.mjs'
 import { buildOutreach } from './lib/factory/outreach.mjs'
+import { validateTarget, opsPolicy, rowToTask, OPS_AS_OF, STATES } from './lib/factory/ops.mjs'
 import { mediaAuth } from './lib/media-auth.mjs'
 import { createPublicClient, http, fallback, getAddress } from 'viem'
 import { mainnet, arbitrum, optimism, polygon, base, bsc } from 'viem/chains'
@@ -500,6 +501,84 @@ app.get('/api/media/registry', async (req, reply) => {
   return buildRegistry()
 })
 
+// ============================================================================
+// ШТАБ ОПЕРАЦИЙ: задания операторам. Единый источник для панели Центра.
+// Панель СТАВИТ задания и отправляет превью; ПУБЛИКУЕТ только кнопка в TG (одна дверь).
+// ============================================================================
+sql`create table if not exists factory_ops (
+  id text primary key, theme text not null, brief text, target text not null,
+  target_kind text default 'own-channel', operator text, language text default 'ru',
+  format text, state text default 'queued', draft text, draft_post_id text,
+  compliance jsonb, created_at timestamptz default now(), updated_at timestamptz default now()
+)`.catch((e) => console.error('factory_ops table:', e.message))
+
+const opsAuth = (req) => {
+  const a = String(req.headers.authorization || '')
+  const t = a.startsWith('Bearer ') ? a.slice(7) : ''
+  return !!MEDIA_REGISTRY_TOKEN && t === MEDIA_REGISTRY_TOKEN
+}
+
+// Список заданий + политика (панель рисует доску).
+app.get('/api/media/ops', async (req, reply) => {
+  if (!opsAuth(req)) return reply.code(401).send({ error: 'unauthorized' })
+  const rows = await sql`select * from factory_ops order by created_at desc limit 200`
+  const tasks = rows.map(rowToTask)
+  const by = (s) => tasks.filter((t) => t.state === s).length
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    dataAsOf: OPS_AS_OF,
+    source: 'media-backend',
+    policy: opsPolicy(),
+    states: STATES,
+    tasks,
+    counters: { total: tasks.length, queued: by('queued'), drafting: by('drafting'), compliance: by('compliance'), awaitingButton: by('awaiting_button'), published: by('published'), rejected: by('rejected') },
+  }
+})
+
+// Создать задание. Цель проверяется по реестру: чужая личка/чат отбиваются с причиной (422).
+app.post('/api/media/ops', async (req, reply) => {
+  if (!opsAuth(req)) return reply.code(401).send({ error: 'unauthorized' })
+  const b = req.body || {}
+  const theme = String(b.theme || '').trim()
+  if (theme.length < 3) return reply.code(400).send({ error: 'theme required' })
+  const v = validateTarget(b.target, b.targetKind || 'own-channel')
+  if (!v.ok) return reply.code(422).send({ error: 'target_forbidden', reason: v.reason, policy: opsPolicy() })
+  const id = newId()
+  await sql`insert into factory_ops (id, theme, brief, target, target_kind, operator, language, format)
+    values (${id}, ${theme}, ${String(b.brief || '').slice(0, 4000)}, ${v.account.handle || v.account.url},
+            ${b.targetKind || 'own-channel'}, ${String(b.operator || 'broadcast').slice(0, 40)},
+            ${String(b.language || 'ru').slice(0, 5)}, ${String(b.format || '').slice(0, 40)})`
+  const [row] = await sql`select * from factory_ops where id = ${id}`
+  return { ok: true, task: rowToTask(row) }
+})
+
+// Отправить черновик задания на ОТК и превью основателю. НЕ публикует.
+app.post('/api/media/ops/:id/submit', async (req, reply) => {
+  if (!opsAuth(req)) return reply.code(401).send({ error: 'unauthorized' })
+  if (!RV.bot || !RV.sign) return reply.code(503).send({ error: 'not configured' })
+  const id = safeId(req.params.id)
+  const [row] = await sql`select * from factory_ops where id = ${id}`
+  if (!row) return reply.code(404).send({ error: 'not found' })
+  const text = String(req.body?.draft || row.draft || '').trim()
+  if (text.length < 10) return reply.code(400).send({ error: 'draft required' })
+  const facts = await getFacts()
+  const verdict = checkPost(text, facts)
+  await sql`update factory_ops set draft = ${text}, compliance = ${sql.json(verdict)},
+    state = ${verdict.pass ? 'awaiting_button' : 'compliance'}, updated_at = now() where id = ${id}`
+  if (!verdict.pass) return { ok: false, blocked: true, verdict, summary: verdictLine(verdict) } // гейт: превью не уходит
+  const postId = newId()
+  await sql`insert into factory_posts (id, text, channel, lang, verdict) values (${postId}, ${text}, ${row.target}, ${row.language}, ${sql.json(verdict)})`
+  await sql`update factory_ops set draft_post_id = ${postId}, updated_at = now() where id = ${id}`
+  const preview = `📣 <b>Задание штаба</b> → ${esc(row.target)}\n<i>${esc(row.theme)}</i>\n\n${esc(text).slice(0, 3400)}\n\n${esc(verdictLine(verdict))}`
+  const buttons = [[
+    { text: '✅ Опубликовать', url: `${RV.base}/api/factory/publish/${postId}?sig=${sign(postId, 'fpublish')}` },
+    { text: '✏️ На редакцию', url: `${RV.base}/api/factory/reject/${postId}?sig=${sign(postId, 'freject')}` },
+  ]]
+  const r = await tgSend(preview, buttons)
+  return { ok: !!r.ok, taskId: id, postId, verdict, summary: verdictLine(verdict) }
+})
+
 // Секция «Дистрибуция и адресная работа»: роли агентов, кампании по теме, очереди.
 // Тот же доверенный контур, что реестр (Bearer MEDIA_REGISTRY_TOKEN), read-only.
 app.get('/api/media/outreach', async (req, reply) => {
@@ -610,6 +689,10 @@ app.get('/api/factory/publish/:id', async (req, reply) => {
   if (row.status === 'published') return page('Уже опубликовано', 'Этот пост уже отправлен.', 'ok')
   const posted = await tgPostChannel(row.channel, row.text)
   await sql`update factory_posts set status = 'published' where id = ${id}`
+  // Задание штаба (если пост пришёл из него) переезжает в «опубликовано» — состояние
+  // доски меняет ТОЛЬКО кнопка, панель Центра его не выставляет.
+  await sql`update factory_ops set state = 'published', updated_at = now() where draft_post_id = ${id}`
+    .catch((e) => console.error('ops publish sync:', e.message))
 
   // РАЗДАТЧИК: после кнопки — веером на остальные подключённые площадки.
   // Каждый исход пишем в журнал; неподключённые площадки — skipped, не ошибка.
@@ -634,6 +717,8 @@ app.get('/api/factory/reject/:id', async (req, reply) => {
   const id = safeId(req.params.id)
   if (!verify(id, 'freject', req.query.sig)) { reply.code(403); return page('Отказано', 'Неверная подпись ссылки.', 'err') }
   await sql`update factory_posts set status = 'rejected' where id = ${id}`
+  await sql`update factory_ops set state = 'rejected', updated_at = now() where draft_post_id = ${id}`
+    .catch((e) => console.error('ops reject sync:', e.message))
   await tgSend(`✏️ Пост на редакцию (id ${esc(id)}) — не опубликован, жду правок.`, null)
   return page('На редакцию', 'Пост не опубликован. Редакция получила пометку.', 'ok')
 })
